@@ -35,10 +35,13 @@ log() { printf "[%s] %s\n" "$(date '+%H:%M:%S')" "$*"; }
 err() { printf "ERROR: %s\n" "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+trap 'err "Command failed (exit $?) at line $LINENO"; exit $?' ERR
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") <input_dir> [--encoder cpu-x265|hw-hevc|av1] [--out "<dir>"]
-                       [--audio "<list>"] [--audio-mode copy|aac] [--tune-grain]
+                       [--audio "<list>"] [--audio-mode copy|aac]
+                       [--subs "<list>"] [--tune-grain]
 
 Options:
   --encoder         Video encoder (default: cpu-x265). hw-hevc uses Apple VideoToolbox.
@@ -47,12 +50,14 @@ Options:
                     in the exact order you want, e.g. --audio=5,1,3
                     If omitted, script keeps/re-encodes the first audio only.
   --audio-mode      'copy' (remux selected audio as-is) or 'aac' (re-encode). Default: aac
+  --subs            Comma-separated 1-based subtitle indices, in the desired order.
+                    If omitted, script remuxes all subtitle tracks it finds.
   --tune-grain      Apply x265 tune=grain (better film grain retention; larger size).
 
 Examples:
   $(basename "$0") "/path/to/Season 1"
   $(basename "$0") "/path/to/Season 1" --encoder hw-hevc
-  $(basename "$0") "/path/to/Season 1" --audio=5,1,3 --audio-mode copy
+  $(basename "$0") "/path/to/Season 1" --audio=5,1,3 --audio-mode copy --subs=1,2,3
 EOF
 }
 
@@ -64,6 +69,7 @@ ENCODER="$DEFAULT_ENCODER"
 OUT_DIR=""
 AUDIO_ORDER=""         # e.g. "5,1,3" (1-based among audio streams)
 AUDIO_MODE="aac"       # "aac" (default) or "copy"
+SUBS_ORDER=""
 TUNE_GRAIN="0"
 
 while [[ $# -gt 0 ]]; do
@@ -72,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --out)         shift; OUT_DIR="${1:-}";;
     --audio)       shift; AUDIO_ORDER="${1:-}";;
     --audio-mode)  shift; AUDIO_MODE="${1:-aac}";;
+    --subs)        shift; SUBS_ORDER="${1:-}";;
     --tune-grain)  TUNE_GRAIN="1";;
     -h|--help)     usage; exit 0;;
     *)
@@ -82,6 +89,12 @@ done
 
 [[ -z "$INPUT_DIR" ]] && { err "No input directory provided."; usage; exit 1; }
 [[ ! -d "$INPUT_DIR" ]] && { err "Input directory not found: $INPUT_DIR"; exit 1; }
+
+INPUT_DIR_ORIG="$INPUT_DIR"
+if ! INPUT_DIR="$(cd "$INPUT_DIR_ORIG" && pwd)"; then
+  err "Failed to resolve input directory: $INPUT_DIR_ORIG"
+  exit 1
+fi
 
 [[ -z "$OUT_DIR" ]] && OUT_DIR="${INPUT_DIR%/}_encoded"
 mkdir -p "$OUT_DIR"
@@ -105,6 +118,11 @@ shopt -u nullglob
 
 log "Encoder   : $ENCODER"
 log "Audio sel : ${AUDIO_ORDER:-(first audio only)} (mode: $AUDIO_MODE)"
+if [[ -n "$SUBS_ORDER" ]]; then
+  log "Subs sel  : $SUBS_ORDER (mode: copy)"
+else
+  log "Subs sel  : all (mode: copy)"
+fi
 log "Input     : $INPUT_DIR"
 log "Output    : $OUT_DIR"
 log "Found     : ${#FILES[@]} file(s)"
@@ -113,119 +131,226 @@ log "Found     : ${#FILES[@]} file(s)"
 video_args() {
   case "$ENCODER" in
     cpu-x265)
-      local tune_arg=""
+      local x265_params="crf=${X265_CRF}:aq-mode=2:psy-rd=2"
       if [[ "$TUNE_GRAIN" == "1" || -n "$X265_TUNE" ]]; then
         local tune_val="${X265_TUNE:-grain}"
-        tune_arg=":tune=${tune_val}"
+        x265_params+=":tune=${tune_val}"
       fi
-      # 10-bit improves compression of gradients/grain; VLC supports it.
-      printf -- "-map 0:v:0 -c:v libx265 -preset %s -x265-params crf=%s:aq-mode=2:psy-rd=2%s -pix_fmt yuv420p10le " \
-        "$X265_PRESET" "$X265_CRF" "$tune_arg"
+      printf '%s\n' \
+        "-map" "0:v:0" \
+        "-c:v" "libx265" \
+        "-preset" "$X265_PRESET" \
+        "-x265-params" "$x265_params" \
+        "-pix_fmt" "yuv420p10le"
       ;;
     hw-hevc)
-      printf -- "-map 0:v:0 -c:v hevc_videotoolbox -b:v %s -maxrate %s -bufsize %s -pix_fmt yuv420p -vtag hvc1 " \
-        "$HW_HEVC_AVG_BITRATE" "$HW_HEVC_MAX_BITRATE" "$HW_HEVC_BUFSIZE"
+      printf '%s\n' \
+        "-map" "0:v:0" \
+        "-c:v" "hevc_videotoolbox" \
+        "-b:v" "$HW_HEVC_AVG_BITRATE" \
+        "-maxrate" "$HW_HEVC_MAX_BITRATE" \
+        "-bufsize" "$HW_HEVC_BUFSIZE" \
+        "-pix_fmt" "yuv420p" \
+        "-vtag" "hvc1"
       ;;
     av1)
-      printf -- "-map 0:v:0 -c:v libsvtav1 -crf %s -preset %s -pix_fmt yuv420p " \
-        "$AV1_CRF" "$AV1_PRESET"
+      printf '%s\n' \
+        "-map" "0:v:0" \
+        "-c:v" "libsvtav1" \
+        "-crf" "$AV1_CRF" \
+        "-preset" "$AV1_PRESET" \
+        "-pix_fmt" "yuv420p"
       ;;
     *) err "Unknown encoder: $ENCODER"; exit 1;;
   esac
 }
 
+# Count helper for ffprobe stream selection. Returns 0 on errors.
+stream_count() {
+  local src="$1"; local selector="$2"
+  local out=""
+  if ! out="$(ffprobe -v error -select_streams "$selector" -show_entries stream=index -of csv=p=0 "$src")"; then
+    err "ffprobe failed while probing '$selector' streams for: $src"
+    printf "0"
+    return
+  fi
+  if [[ -z "$out" ]]; then
+    printf "0"
+    return
+  fi
+  printf '%s\n' "$out" | awk 'NF {count++} END {print count+0}'
+}
+
 # Return number of audio streams
 audio_count() {
   local src="$1"
-  ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$src" | wc -l | tr -d ' '
+  stream_count "$src" "a"
 }
 
 # Channels for a given 0-based audio index among audio streams
 channels_for_audio_n() {
   local src="$1"; local n="$2"
-  ffprobe -v error -select_streams a:"$n" -show_entries stream=channels -of csv=p=0 "$src" 2>/dev/null || echo ""
+  local out=""
+  if ! out="$(ffprobe -v error -select_streams a:"$n" -show_entries stream=channels -of csv=p=0 "$src")"; then
+    err "ffprobe failed while reading channels for audio index $n in: $src"
+    echo ""
+    return
+  fi
+  printf '%s\n' "$out"
+}
+
+# Return number of subtitle streams
+subs_count() {
+  local src="$1"
+  stream_count "$src" "s"
 }
 
 # Build mapping & codec args for audio according to AUDIO_ORDER & AUDIO_MODE
 audio_args() {
   local src="$1"
   local total_a; total_a="$(audio_count "$src")"
-  local args=""
-  local i=0
+  total_a="${total_a:-0}"
+  local -a args=()
+  local -a indexes=()
+
+  if (( total_a == 0 )); then
+    log "No audio streams found in: $(basename "$src")"
+    return
+  fi
 
   if [[ -n "$AUDIO_ORDER" ]]; then
-    # Use the provided ORDER (1-based among audio streams), filter invalid indices.
-    IFS=',' read -ra ORDER <<< "$AUDIO_ORDER"
-    local valid_count=0
+    local cleaned="${AUDIO_ORDER//[[:space:]]/}"
+    local -a ORDER=()
+    local IFS=','
+    read -ra ORDER <<< "$cleaned" || true
     for ord in "${ORDER[@]}"; do
-      if [[ ! "$ord" =~ ^[0-9]+$ ]]; then log "Skipping invalid audio index: $ord"; continue; fi
-      if (( ord < 1 )); then log "Skipping out-of-range audio index: $ord"; continue; fi
+      if [[ -z "$ord" ]]; then continue; fi
+      if [[ ! "$ord" =~ ^[0-9]+$ ]]; then
+        log "Skipping invalid audio index: $ord"
+        continue
+      fi
+      if (( ord < 1 )); then
+        log "Skipping out-of-range audio index: $ord"
+        continue
+      fi
       local zero=$((ord-1))
       if (( zero >= total_a )); then
         log "Skipping audio index $ord (only $total_a audio stream(s) present)"
         continue
       fi
-      args+=" -map 0:a:${zero} "
-      ((valid_count++))
+      indexes+=("$zero")
     done
-    if (( valid_count == 0 )); then
+    if (( ${#indexes[@]} == 0 )); then
       log "No valid audio indices from --audio. Falling back to first audio."
-      args+=" -map 0:a:0 "
-      valid_count=1
+      indexes=(0)
     fi
-
-    if [[ "$AUDIO_MODE" == "copy" ]]; then
-      # Remux all selected audio streams as-is
-      args+=" -c:a copy "
-    else
-      # Re-encode each selected audio stream individually
-      i=0
-      for ord in "${ORDER[@]}"; do
-        local zero=$((ord-1))
-        if (( zero < 0 || zero >= total_a )); then continue; fi
-        local ch; ch="$(channels_for_audio_n "$src" "$zero")"
-        if [[ -z "$ch" ]]; then ch=2; fi
-        if (( ch > 2 )); then
-          args+=" -c:a:${i} aac -b:a:${i} ${AUDIO_SURROUND_BITRATE} -ac:${i} 6 "
-        else
-          args+=" -c:a:${i} aac -b:a:${i} ${AUDIO_STEREO_BITRATE} -ac:${i} 2 "
-        fi
-        ((i++))
-      done
-    fi
-    # First selected audio becomes default; clear default on others
-    # (ffmpeg sets default on first a-track by default, but we enforce explicitly)
-    args+=" -disposition:a:0 default "
-    # Ensure others not default
-    local idx=1
-    while (( idx < i )); do
-      args+=" -disposition:a:${idx} 0 "
-      ((idx++))
-    done
   else
-    # No AUDIO_ORDER supplied: keep first audio only, encode per channels
-    args+=" -map 0:a:0 "
-    local ch; ch="$(channels_for_audio_n "$src" "0")"
-    if [[ -z "$ch" ]]; then ch=2; fi
-    if (( ch > 2 )); then
-      args+=" -c:a aac -b:a ${AUDIO_SURROUND_BITRATE} -ac 6 "
-    else
-      args+=" -c:a aac -b:a ${AUDIO_STEREO_BITRATE} -ac 2 "
-    fi
-    args+=" -disposition:a:0 default "
+    indexes=(0)
   fi
 
-  printf "%s" "$args"
+  local idx
+  for idx in "${indexes[@]}"; do
+    args+=("-map" "0:a:${idx}")
+  done
+
+  if [[ "$AUDIO_MODE" == "copy" ]]; then
+    args+=("-c:a" "copy")
+  else
+    local out_i=0
+    for idx in "${indexes[@]}"; do
+      local ch
+      ch="$(channels_for_audio_n "$src" "$idx")"
+      if [[ -z "$ch" ]]; then ch=2; fi
+      if [[ "$ch" =~ ^[0-9]+$ ]] && (( ch > 2 )); then
+        args+=("-c:a:${out_i}" "aac" "-b:a:${out_i}" "$AUDIO_SURROUND_BITRATE" "-ac:${out_i}" "6")
+      else
+        args+=("-c:a:${out_i}" "aac" "-b:a:${out_i}" "$AUDIO_STEREO_BITRATE" "-ac:${out_i}" "2")
+      fi
+      out_i=$((out_i+1))
+    done
+  fi
+
+  if (( ${#indexes[@]} > 0 )); then
+    args+=("-disposition:a:0" "default")
+    local disp=1
+    while (( disp < ${#indexes[@]} )); do
+      args+=("-disposition:a:${disp}" "0")
+      disp=$((disp+1))
+    done
+  fi
+
+  printf '%s\n' "${args[@]}"
 }
 
-# Copy all subs if present
-subs_args() { printf -- "-map 0:s? -c:s copy "; }
+# Copy selected subs if requested, otherwise keep all
+subs_args() {
+  local src="$1"
+  if [[ -z "$SUBS_ORDER" ]]; then
+    printf '%s\n' "-map" "0:s?" "-c:s" "copy"
+    return
+  fi
+
+  local total_s; total_s="$(subs_count "$src")"
+  total_s="${total_s:-0}"
+  if [[ -z "$total_s" || "$total_s" -eq 0 ]]; then
+    log "No subtitle streams found in: $(basename "$src")"
+    return
+  fi
+
+  local -a args=()
+  local -a indexes=()
+  local cleaned="${SUBS_ORDER//[[:space:]]/}"
+  local -a ORDER=()
+  local IFS=','
+  read -ra ORDER <<< "$cleaned" || true
+  for ord in "${ORDER[@]}"; do
+    if [[ -z "$ord" ]]; then continue; fi
+    if [[ ! "$ord" =~ ^[0-9]+$ ]]; then
+      log "Skipping invalid subtitle index: $ord"
+      continue
+    fi
+    if (( ord < 1 )); then
+      log "Skipping out-of-range subtitle index: $ord"
+      continue
+    fi
+    local zero=$((ord-1))
+    if (( zero >= total_s )); then
+      log "Skipping subtitle index $ord (only $total_s subtitle stream(s) present)"
+      continue
+    fi
+    indexes+=("$zero")
+  done
+
+  if (( ${#indexes[@]} == 0 )); then
+    log "No valid subtitle indices from --subs. Falling back to all subtitles."
+    printf '%s\n' "-map" "0:s?" "-c:s" "copy"
+    return
+  fi
+
+  local idx
+  for idx in "${indexes[@]}"; do
+    args+=("-map" "0:s:${idx}")
+  done
+
+  args+=("-c:s" "copy")
+  args+=("-disposition:s:0" "default")
+  local disp=1
+  while (( disp < ${#indexes[@]} )); do
+    args+=("-disposition:s:${disp}" "0")
+    disp=$((disp+1))
+  done
+
+  printf '%s\n' "${args[@]}"
+}
 
 # -------- Main loop --------
 i=0
 for in_file in "${FILES[@]}"; do
-  ((i++))
-  rel="${in_file#$INPUT_DIR/}"
+  ((++i))
+  rel="${in_file#"$INPUT_DIR"/}"
+  if [[ "$rel" == "$in_file" ]]; then
+    rel="$(basename "$in_file")"
+  fi
   base="${rel%.*}"
   out_dir_for_file="$(dirname "$OUT_DIR/$rel")"
   mkdir -p "$out_dir_for_file"
@@ -236,17 +361,31 @@ for in_file in "${FILES[@]}"; do
     continue
   fi
 
-  v_args="$(video_args)"
-  a_args="$(audio_args "$in_file")"
-  s_args="$(subs_args)"
+  declare -a v_args=()
+  while IFS= read -r arg; do
+    [[ -z "$arg" ]] && continue
+    v_args+=("$arg")
+  done < <(video_args) || true
+
+  declare -a a_args=()
+  while IFS= read -r arg; do
+    [[ -z "$arg" ]] && continue
+    a_args+=("$arg")
+  done < <(audio_args "$in_file") || true
+
+  declare -a s_args=()
+  while IFS= read -r arg; do
+    [[ -z "$arg" ]] && continue
+    s_args+=("$arg")
+  done < <(subs_args "$in_file") || true
 
   log "[$i/${#FILES[@]}] Encoding: $rel"
   log "Output: $out_file"
   set -x
   ffmpeg -hide_banner -y -i "$in_file" \
-    $v_args \
-    $a_args \
-    $s_args \
+    "${v_args[@]}" \
+    "${a_args[@]}" \
+    "${s_args[@]}" \
     -map_metadata 0 \
     -movflags +faststart \
     "$out_file"

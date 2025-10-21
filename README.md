@@ -10,7 +10,10 @@ Video Piper is a tiny, single-script batch transcoder named after the fictional 
 ./encode.sh "/path/to/Season 1" \
   --encoder cpu-x265 \
   --audio 1,2 \
-  --audio-mode copy
+  --audio-mode copy \
+  --subs 1,2,3
 ```
+
+Use `--subs` to pick specific subtitle tracks (1-based indices) instead of keeping every subtitle stream.
 
 Run `./encode.sh --help` for the full list of options.
