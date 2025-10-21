@@ -2,7 +2,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# bd_batch_compress.sh
+# encode.sh
 # macOS (Apple Silicon ready). Batch-encode a directory of TV episodes.
 # Video defaults: HEVC x265 (CPU, 10-bit) CRF 23, preset slow.
 # NEW: --audio=<list> to keep audio tracks in a given ORDER (1-based among audio streams),
